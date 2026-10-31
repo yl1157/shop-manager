@@ -10,6 +10,6 @@
 // While both are empty, the page shows "Preview only" and keeps everything in your own browser.
 // ---------------------------------------------------------------------------------------------
 window.SHOP_CONFIG = {
-  supabaseUrl: '',
-  supabaseAnonKey: '',
+  supabaseUrl: 'https://kqxkurmtqfqylfzctsvo.supabase.co',
+  supabaseAnonKey: 'sb_publishable_2n7uD9hrgZ-394srzo87dg_iddCGhHI',
 };
