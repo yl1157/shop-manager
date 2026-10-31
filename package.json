@@ -1,0 +1,16 @@
+{
+  "name": "shop-manager",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Claim by Instagram username, pay, get matched to the seller's real payment feed.",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node --test tests/core.test.mjs tests/db.test.mjs",
+    "test:rules": "node --test tests/core.test.mjs",
+    "build:demo": "node build.mjs --demo"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.13"
+  }
+}
