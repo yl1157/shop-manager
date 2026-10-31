@@ -153,8 +153,10 @@ create table if not exists public.orders (
   hold_expires_at    timestamptz not null,
   cancel_reason      text,
   cancelled_at       timestamptz,
-  created_at         timestamptz not null default now()
+  created_at         timestamptz not null default now(),
+  ship_to            jsonb check (ship_to is null or jsonb_typeof(ship_to) = 'object')   -- shipping address, filled in after payment is confirmed
 );
+alter table public.orders add column if not exists ship_to jsonb check (ship_to is null or jsonb_typeof(ship_to) = 'object');
 create index if not exists orders_user_idx   on public.orders (username);
 create index if not exists orders_status_idx on public.orders (status, hold_expires_at);
 
@@ -264,6 +266,40 @@ begin
     perform private.fail('bad_passcode', 'Passcode: letters, numbers and symbols only — no spaces or emoji.');
   end if;
   return c;
+end $$;
+
+-- Shipping addresses. One cleaner for the buyer and the seller: collapses spaces, checks lengths, and for a US address needs a
+-- state and a ZIP code. The page applies the same rules, so the messages read the same everywhere.
+create or replace function private.squash(s text) returns text language sql immutable as
+$$ select btrim(regexp_replace(coalesce(s, ''), '\s+', ' ', 'g')) $$;
+
+create or replace function private.clean_address(p jsonb) returns jsonb language plpgsql stable as $$
+declare nm text; l1 text; l2 text; ct text; rg text; zp text; co text; us boolean;
+begin
+  if p is null or jsonb_typeof(p) <> 'object' then perform private.fail('bad_address', 'Enter the shipping address.'); end if;
+  nm := private.squash(p ->> 'name');   l1 := private.squash(p ->> 'line1');  l2 := private.squash(p ->> 'line2');
+  ct := private.squash(p ->> 'city');   rg := private.squash(p ->> 'region'); zp := private.squash(p ->> 'postal');
+  co := private.squash(p ->> 'country');
+  if co = '' then co := 'United States'; end if;
+  us := lower(co) in ('us', 'usa', 'u.s.', 'u.s.a.', 'united states', 'united states of america');
+  if us then
+    co := 'United States';
+    if rg ~ '^[A-Za-z]{2}$' then rg := upper(rg); end if;
+  end if;
+  if nm = '' then perform private.fail('bad_address', 'Enter the full name for the parcel.'); end if;
+  if l1 = '' then perform private.fail('bad_address', 'Enter the street address.'); end if;
+  if ct = '' then perform private.fail('bad_address', 'Enter the city.'); end if;
+  if us and rg = '' then perform private.fail('bad_address', 'Enter the state.'); end if;
+  if zp = '' then perform private.fail('bad_address', 'Enter the ZIP or postal code.'); end if;
+  if us and zp !~ '^[0-9]{5}(-[0-9]{4})?$' then perform private.fail('bad_address', 'Enter a 5-digit ZIP code, like 07030.'); end if;
+  if char_length(nm) > 80  then perform private.fail('bad_address', 'The name is too long (80 characters at most).'); end if;
+  if char_length(l1) > 120 then perform private.fail('bad_address', 'The street address is too long (120 characters at most).'); end if;
+  if char_length(l2) > 120 then perform private.fail('bad_address', 'The second address line is too long (120 characters at most).'); end if;
+  if char_length(ct) > 60  then perform private.fail('bad_address', 'The city is too long (60 characters at most).'); end if;
+  if char_length(rg) > 60  then perform private.fail('bad_address', 'The state or region is too long (60 characters at most).'); end if;
+  if char_length(zp) > 20  then perform private.fail('bad_address', 'The ZIP or postal code is too long (20 characters at most).'); end if;
+  if char_length(co) > 60  then perform private.fail('bad_address', 'The country is too long (60 characters at most).'); end if;
+  return jsonb_build_object('name', nm, 'line1', l1, 'line2', l2, 'city', ct, 'region', rg, 'postal', zp, 'country', co);
 end $$;
 
 create or replace function private.norm_txn(s text) returns text language sql immutable as
@@ -542,7 +578,7 @@ create or replace function private.order_json(p_order uuid) returns jsonb langua
   select jsonb_build_object(
     'id', o.id, 'no', o.no, 'username', o.username, 'status', o.status, 'fulfillment', o.fulfillment,
     'tracking', o.tracking, 'createdAt', private.ms(o.created_at), 'holdExpiresAt', private.ms(o.hold_expires_at),
-    'shippingFeeCents', o.shipping_fee_cents, 'note', o.note, 'cancelReason', o.cancel_reason,
+    'shippingFeeCents', o.shipping_fee_cents, 'note', o.note, 'cancelReason', o.cancel_reason, 'shipTo', o.ship_to,
     'lines', coalesce((select jsonb_agg(jsonb_build_object('variantId', l.variant_id, 'productId', l.product_id, 'name', l.name,
                        'variantName', l.variant_name, 'qty', l.qty, 'unitCents', l.unit_cents) order by l.position)
                        from public.order_lines l where l.order_id = o.id), '[]'::jsonb),
@@ -613,6 +649,7 @@ begin
         'remaining', private.payment_remaining(p.id)) order by p.created_at desc, p.no desc)
         from public.payments p where p.username = u), '[]'::jsonb),
     'creditCents', private.buyer_credit(u), 'dueCents', private.buyer_due(u), 'pendingCents', private.buyer_pending(u),
+    'lastShipTo', (select o.ship_to from public.orders o where o.username = u and o.ship_to is not null order by o.created_at desc, o.no desc limit 1),
     'toSendCents', coalesce((select sum(greatest(0, private.order_due(o.id) - private.order_pending(o.id)))::int
                              from public.orders o where o.username = u and o.status = 'open'), 0));
 end $$;
@@ -828,6 +865,28 @@ begin
   return private.cancel_order(p_order_id, 'buyer', 'Cancelled by buyer');
 end $$;
 
+-- Once a payment is confirmed the buyer says where to send the parcel. The address goes on every paid order of theirs that has
+-- not shipped yet; it can be changed until the seller marks an order Shipped, and shipped orders keep the address they went to.
+create or replace function public.save_address(p_username text, p_passcode text, p_address jsonb) returns jsonb
+language plpgsql security definer set search_path = public, private, extensions, pg_temp as $$
+declare u text := private.norm_user(p_username); err jsonb; a jsonb; nos int[];
+begin
+  perform private.expire_holds();
+  err := private.check_pass(u, p_passcode);
+  if err is not null then return err; end if;
+  a := private.clean_address(p_address) || jsonb_build_object('savedAt', private.ms(private.now_()), 'by', 'buyer');
+  with changed as (
+    update public.orders o set ship_to = a
+     where o.username = u and o.status = 'open' and o.fulfillment <> 'shipped' and private.order_due(o.id) = 0
+    returning o.no)
+  select coalesce(array_agg(no order by no), '{}') into nos from changed;
+  if cardinality(nos) = 0 then
+    perform private.fail('nothing_to_ship', 'There is nothing to ship yet. You can add an address once the seller has confirmed your payment.');
+  end if;
+  perform private.log_event('@' || u, format('added a shipping address for %s', (select string_agg('#' || n, ', ' order by n) from unnest(nos) n)));
+  return jsonb_build_object('orderNos', to_jsonb(nos));
+end $$;
+
 -- Lets the upload policy (section 8) check that a path was issued by submit_payment and is still fresh.
 create or replace function private.can_upload_proof(obj_name text) returns boolean language sql stable security definer
 set search_path = public, pg_temp as $$
@@ -866,7 +925,7 @@ begin
     'orders', coalesce((select jsonb_agg(jsonb_build_object('id', o.id, 'no', o.no, 'username', o.username, 'status', o.status,
         'fulfillment', o.fulfillment, 'tracking', o.tracking, 'createdAt', private.ms(o.created_at),
         'holdExpiresAt', private.ms(o.hold_expires_at), 'shippingFeeCents', o.shipping_fee_cents, 'note', o.note,
-        'cancelledAt', private.ms(o.cancelled_at), 'cancelReason', o.cancel_reason,
+        'cancelledAt', private.ms(o.cancelled_at), 'cancelReason', o.cancel_reason, 'shipTo', o.ship_to,
         'lines', coalesce((select jsonb_agg(jsonb_build_object('variantId', l.variant_id, 'productId', l.product_id, 'name', l.name,
                   'variantName', l.variant_name, 'qty', l.qty, 'unitCents', l.unit_cents) order by l.position)
                   from public.order_lines l where l.order_id = o.id), '[]'::jsonb)) order by o.no)
@@ -1046,6 +1105,24 @@ begin
          tracking = case when p_to = 'shipped' or tr <> '' then tr else tracking end
    where id = o.id;
   perform private.log_event('admin', format('#%s → %s', o.no, p_to));
+end $$;
+
+-- The seller can type or fix an address too (for example one the buyer sent by message), or clear it with null.
+create or replace function public.admin_set_address(p_order_id uuid, p_address jsonb) returns void
+language plpgsql set search_path = public, private, extensions, pg_temp as $$
+declare o record;
+begin
+  perform private.require_admin();
+  select id, no, status into o from public.orders where id = p_order_id for update;
+  if not found or o.status <> 'open' then perform private.fail('bad_state', 'Only open orders can be updated.'); end if;
+  if p_address is null or p_address = 'null'::jsonb or p_address = '{}'::jsonb then
+    update public.orders set ship_to = null where id = o.id;
+    perform private.log_event('admin', format('#%s address removed', o.no));
+  else
+    update public.orders set ship_to = private.clean_address(p_address) || jsonb_build_object('savedAt', private.ms(private.now_()), 'by', 'seller')
+     where id = o.id;
+    perform private.log_event('admin', format('#%s address saved', o.no));
+  end if;
 end $$;
 
 -- Set (not add) the shipping fee on an order. Lowering it below what is already paid returns the difference to credit.
@@ -1399,13 +1476,13 @@ grant insert on public.activity_log to authenticated;
 -- buyer-facing functions: open to everyone, each one checks the passcode itself
 grant execute on function public.buyer_status(text), public.shop_info(), public.my_account(text, text),
   public.place_order(text, text, jsonb), public.submit_payment(text, text, jsonb),
-  public.cancel_my_order(text, text, uuid) to anon, authenticated;
+  public.cancel_my_order(text, text, uuid), public.save_address(text, text, jsonb) to anon, authenticated;
 
 -- seller functions: signed-in users only (and each one re-checks public.admins)
 grant execute on function public.admin_snapshot(int), public.release_expired_holds(), public.admin_save_settings(jsonb),
   public.admin_confirm_payment(uuid, uuid, int, boolean, boolean), public.admin_reject_payment(uuid, text),
   public.admin_cancel_order(uuid, text), public.admin_set_fulfillment(uuid, text, text),
-  public.admin_set_shipping_fee(uuid, int), public.admin_extend_hold(uuid, int), public.admin_import_incoming(jsonb),
+  public.admin_set_address(uuid, jsonb), public.admin_set_shipping_fee(uuid, int), public.admin_extend_hold(uuid, int), public.admin_import_incoming(jsonb),
   public.admin_ignore_incoming(uuid, boolean), public.admin_assign_incoming(uuid, text, uuid[], boolean),
   public.admin_record_payment(text, text, int, text, uuid[], boolean), public.admin_merge_buyer(text, text),
   public.admin_save_group(jsonb), public.admin_save_product(jsonb), public.admin_delete_product(uuid),
