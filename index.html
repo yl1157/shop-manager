@@ -86,6 +86,7 @@ main:focus{outline:none}
 .err{background:var(--red-50);color:var(--red-800);border-radius:var(--radius);padding:9px 12px;font-size:13px;margin:0 0 12px}
 .note{background:var(--surface2);border-radius:var(--radius);padding:9px 12px;font-size:13px;color:var(--text2)}
 .note.amber{background:var(--amber-50);color:var(--amber-800)}
+.addr{background:var(--surface2);border-radius:var(--radius);padding:10px 12px;line-height:1.5;font-size:14px;color:var(--text)}
 .note.teal{background:var(--teal-50);color:var(--teal-800)}
 .note.info{background:var(--accent-light);color:var(--accent-dark)}
 .check{display:flex;gap:9px;align-items:flex-start;padding:7px 0;cursor:pointer}
@@ -617,7 +618,7 @@ function placeOrder(state, { username, lines }, now) {
   for (const [deadline, rs] of buckets) {
     const o = {
       id: uid('o'), no: nextNo(state, 'order'), username: u, status: 'open', fulfillment: 'pending', tracking: '',
-      createdAt: now, holdExpiresAt: deadline, shippingFeeCents: 0, note: '',
+      createdAt: now, holdExpiresAt: deadline, shippingFeeCents: 0, note: '', shipTo: null,
       lines: rs.map(r => ({ variantId: r.v.id, productId: r.p.id, name: r.p.name, variantName: r.v.name || '', qty: r.qty, unitCents: unitPrice(r.p, r.v) })),
     };
     rs.forEach(r => { r.v.stock -= r.qty; });
@@ -673,6 +674,60 @@ function setFulfillment(state, { orderId, to, tracking = '' }, now) {
   if (to === 'shipped' || tr) o.tracking = tr;       // keep a number typed before "Packed"; shipping with none clears it
   log(state, 'admin', `#${o.no} → ${to}`, now);
 }
+/* ---------- shipping addresses ---------- */
+const US_NAMES = ['us', 'usa', 'u.s.', 'u.s.a.', 'united states', 'united states of america'];
+const squash = s => String(s == null ? '' : s).replace(/\s+/g, ' ').trim();
+const chars = s => Array.from(s).length;
+/** Same rules, same order, same messages as private.clean_address in db/schema.sql. Returns the tidy address or throws 'bad_address'. */
+function cleanAddress(raw) {
+  const bad = m => { throw new AppError('bad_address', m); };
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) bad('Enter the shipping address.');
+  const nm = squash(raw.name), l1 = squash(raw.line1), l2 = squash(raw.line2), ct = squash(raw.city), zp = squash(raw.postal);
+  let rg = squash(raw.region), co = squash(raw.country);
+  if (co === '') co = 'United States';
+  const us = US_NAMES.includes(co.toLowerCase());
+  if (us) { co = 'United States'; if (/^[A-Za-z]{2}$/.test(rg)) rg = rg.toUpperCase(); }
+  if (!nm) bad('Enter the full name for the parcel.');
+  if (!l1) bad('Enter the street address.');
+  if (!ct) bad('Enter the city.');
+  if (us && !rg) bad('Enter the state.');
+  if (!zp) bad('Enter the ZIP or postal code.');
+  if (us && !/^[0-9]{5}(-[0-9]{4})?$/.test(zp)) bad('Enter a 5-digit ZIP code, like 07030.');
+  [[nm, 80, 'name'], [l1, 120, 'street address'], [l2, 120, 'second address line'], [ct, 60, 'city'], [rg, 60, 'state or region'],
+   [zp, 20, 'ZIP or postal code'], [co, 60, 'country']].forEach(([v, max, label]) => {
+    if (chars(v) > max) bad(`The ${label} is too long (${max} characters at most).`);
+  });
+  return { name: nm, line1: l1, line2: l2, city: ct, region: rg, postal: zp, country: co };
+}
+/** The buyer says where to send it. It goes on every paid order of theirs that hasn't shipped; shipped orders keep the address they went to. */
+function saveAddress(state, { username, address }, now) {
+  const a = { ...cleanAddress(address), savedAt: now, by: 'buyer' };
+  const hit = state.orders.filter(o => o.username === username && o.status === 'open' && o.fulfillment !== 'shipped' && orderDue(state, o) === 0).sort((x, y) => x.no - y.no);
+  if (!hit.length) throw new AppError('nothing_to_ship', 'There is nothing to ship yet. You can add an address once the seller has confirmed your payment.');
+  hit.forEach(o => { o.shipTo = { ...a }; });
+  log(state, '@' + username, `added a shipping address for ${hit.map(o => '#' + o.no).join(', ')}`, now);
+  return { orderNos: hit.map(o => o.no) };
+}
+/** Seller: type or fix one order's address, or clear it (address null). */
+function setOrderAddress(state, { orderId, address }, now) {
+  const o = byId(state.orders, orderId);
+  if (!o || o.status !== 'open') throw new AppError('bad_state', 'Only open orders can be updated.');
+  if (address == null || (typeof address === 'object' && !Array.isArray(address) && !Object.keys(address).length)) {
+    o.shipTo = null; log(state, 'admin', `#${o.no} address removed`, now); return;
+  }
+  o.shipTo = { ...cleanAddress(address), savedAt: now, by: 'seller' };
+  log(state, 'admin', `#${o.no} address saved`, now);
+}
+/** An address as lines for display and for copying into a label. The country is left out for US addresses. */
+function addressLines(a) {
+  if (!a) return [];
+  const cityLine = [a.city, [a.region, a.postal].filter(Boolean).join(' ')].filter(Boolean).join(', ');
+  return [a.name, a.line1, a.line2, cityLine, a.country && a.country !== 'United States' ? a.country : ''].filter(Boolean);
+}
+const addressText = a => addressLines(a).join('\n');
+/** A paid order that hasn't shipped and still has no address. */
+const needsAddress = (state, o) => o.status === 'open' && o.fulfillment !== 'shipped' && !o.shipTo && orderPayState(state, o) === 'paid';
+
 /** If an order is now worth less than what was paid on it (fee lowered), push the excess back to credit. */
 function trimOverpayment(state, o) {
   let excess = orderPaid(state, o.id) - orderTotal(o);
@@ -1122,7 +1177,8 @@ function accountView(state, username, now) {
     covers: state.allocations.filter(a => a.paymentId === p.id).map(a => ({ orderNo: (byId(state.orders, a.orderId) || {}).no, cents: a.amountCents })),
     remaining: paymentRemaining(state, p),
   }));
-  return { username, orders, payments, creditCents: buyerCredit(state, username), dueCents: buyerDue(state, username), pendingCents: buyerPending(state, username),
+  const lastShipTo = (orders.filter(o => o.shipTo).sort((a, b) => b.createdAt - a.createdAt || b.no - a.no)[0] || {}).shipTo || null;
+  return { username, orders, payments, lastShipTo, creditCents: buyerCredit(state, username), dueCents: buyerDue(state, username), pendingCents: buyerPending(state, username),
     toSendCents: sumBy(orders.filter(o => o.status === 'open'), o => o.toSend) };
 }
 function dashboard(state, now) {
@@ -1136,6 +1192,7 @@ function dashboard(state, now) {
     expiringSoon: soon.length, overdue: lateUnpaid.length,
     toPack: open.filter(o => orderPayState(state, o) === 'paid' && o.fulfillment === 'pending').length,
     toShip: open.filter(o => orderPayState(state, o) === 'paid' && o.fulfillment === 'packed').length,
+    needAddress: open.filter(o => needsAddress(state, o)).length,
     receivableCents: sumBy(open, o => orderDue(state, o)),
     receivedCents: sumBy(state.payments.filter(p => p.status === 'confirmed'), p => p.amountCents),
     creditCents: sumBy(Object.keys(state.buyers), u => buyerCredit(state, u)),
@@ -1172,6 +1229,7 @@ const Core = {
   assignIncoming, recordManualPayment, addIncoming, ignoreIncoming, parseDelimited, parseFeed,
   nameSim, scorePair, suggestMatches, suggestBuyersForIncoming,
   upsertGroup, upsertProduct, deleteProduct, mergeBuyer, accountView, dashboard, checkInvariants,
+  cleanAddress, saveAddress, setOrderAddress, addressLines, addressText, needsAddress,
 };
 /* </core> */
 
@@ -1260,6 +1318,10 @@ const api = {
     const u = Core.normUser(username); sweep(); checkPass(u, passcode);
     return tx((d, now) => { const p = Core.submitPayment(d, { username: u, ...rest }, now); return { paymentId: p.id, no: p.no }; });
   },
+  async saveAddress({ username, passcode, address }) {
+    const u = Core.normUser(username); sweep(); checkPass(u, passcode);
+    return tx((d, now) => Core.saveAddress(d, { username: u, address }, now));
+  },
   async cancelMyOrder({ username, passcode, orderId }) {
     const u = Core.normUser(username); sweep(); checkPass(u, passcode);
     return tx((d, now) => {
@@ -1273,7 +1335,7 @@ const api = {
 /* ---------- seller calls (production: authenticated Supabase session + RLS) ---------- */
 const adm = {};
 ['confirmPayment', 'rejectPayment', 'assignIncoming', 'recordManualPayment', 'ignoreIncoming', 'cancelOrder',
- 'setFulfillment', 'setShippingFee', 'extendHold', 'upsertGroup', 'upsertProduct', 'mergeBuyer'].forEach(name => {
+ 'setFulfillment', 'setOrderAddress', 'setShippingFee', 'extendHold', 'upsertGroup', 'upsertProduct', 'mergeBuyer'].forEach(name => {
   adm[name] = async args => tx((d, now) => { const r = Core[name](d, args, now); return r === undefined ? null : r; });
 });
 adm.addIncoming = async items => tx((d, now) => Core.addIncoming(d, items, now));
@@ -1607,6 +1669,7 @@ const LIVE = (() => {
       if (r.proofPath && proof) await uploadProof(r.proofPath, proof);
       return { paymentId: r.paymentId, no: r.no };
     },
+    saveAddress: async a => unwrap(await rpc('save_address', { ...who(a), p_address: a.address })),
     cancelMyOrder: async a => { const r = unwrap(await rpc('cancel_my_order', { ...who(a), p_order_id: a.orderId })); await touch(); return r; },
   };
 
@@ -1621,6 +1684,7 @@ const LIVE = (() => {
     ignoreIncoming: S_('admin_ignore_incoming', a => ({ p_incoming_id: a.incomingId, p_ignore: a.ignore !== false })),
     cancelOrder: S_('admin_cancel_order', a => ({ p_order_id: a.orderId, p_reason: a.reason || '' })),
     setFulfillment: S_('admin_set_fulfillment', a => ({ p_order_id: a.orderId, p_to: a.to, p_tracking: a.tracking || '' })),
+    setOrderAddress: S_('admin_set_address', a => ({ p_order_id: a.orderId, p_address: a.address || null })),
     setShippingFee: S_('admin_set_shipping_fee', a => ({ p_order_id: a.orderId, p_cents: a.cents })),
     extendHold: S_('admin_extend_hold', a => ({ p_order_id: a.orderId, p_hours: a.hours })),
     upsertGroup: S_('admin_save_group', g => ({ p_group: g })),
@@ -1925,11 +1989,20 @@ function orderChips(o) {
     if (o.pending > 0 && o.payState !== 'paid') c.push(['Payment in review', 'b-pending']);
     if (o.fulfillment === 'packed') c.push(['Packed', 'b-ok']);
     if (o.fulfillment === 'shipped') c.push(['Shipped', 'b-ok']);
+    if (o.payState === 'paid' && o.fulfillment !== 'shipped' && !o.shipTo) c.push(['Address needed', 'b-pending']);
   }
   return c.map(([t, k]) => html`<span class="badge ${k}">${t}</span>`);
 }
 const timerChip = o => (o.status === 'open' && o.due > 0 && o.pending === 0 && o.paid === 0)
   ? html`<span class="timer ${o.leftMs < 6 * Core.HOUR ? 'late' : ''}">${o.leftMs > 3 * Core.DAY ? 'Pay by ' + dday(o.holdExpiresAt) : 'Pay within ' + left(o.leftMs)}</span>` : '';
+/** After a payment is confirmed: ask where to send it, or show where it is going. */
+const addressEligible = a => a.orders.filter(o => o.status === 'open' && o.fulfillment !== 'shipped' && o.due === 0 && o.payState === 'paid');
+function addressCard(a) {
+  const el = addressEligible(a); if (!el.length) return '';
+  const missing = el.filter(o => !o.shipTo), have = el.find(o => o.shipTo), nos = list => list.map(o => '#' + o.no).join(', ');
+  if (missing.length) return html`<div class="note amber" style="margin-bottom:16px"><b>Where should we send it?</b><div style="margin-top:2px">Your payment for ${nos(missing)} is confirmed. Add your shipping address so it can go out.</div><div class="row" style="margin-top:10px"><button type="button" class="btn primary sm" data-act="edit-address">Add shipping address</button></div></div>`;
+  return html`<div class="card" style="margin-bottom:16px"><div class="row"><b class="grow">Shipping to</b><button type="button" class="btn sm" data-act="edit-address">Change address</button></div><div class="addr" style="margin-top:8px">${Core.addressLines(have.shipTo).map(l => html`<div>${l}</div>`)}</div><div class="small muted" style="margin-top:6px">For ${nos(el)}. You can change it until the order is marked shipped.</div></div>`;
+}
 async function viewOrders() {
   if (!ui.session) return lookupView();
   let a;
@@ -1944,6 +2017,7 @@ async function viewOrders() {
       <div class="stat"><b>${money(a.creditCents)}</b><span>Credit</span></div></div>
     ${hints ? html`<p class="small muted" style="margin:-6px 0 14px">${hints}</p>` : ''}
     <div class="row" style="margin-bottom:18px">${a.toSendCents > 0 ? html`<button type="button" class="btn primary" data-act="pay-all">Pay ${money(a.toSendCents)}</button>` : ''}<button type="button" class="btn" data-act="pay-ahead">Add credit ahead of time</button><a class="btn ghost" href="#/shop">Keep shopping</a></div>
+    ${addressCard(a)}
     ${a.orders.length ? '' : html`<div class="empty"><b>No claims yet</b>When you claim something it will show up here.</div>`}
     ${open.map(o => orderCard(o))}
     ${a.payments.length ? html`<h2 class="h" style="margin-top:22px">Payments you’ve sent</h2><div class="card" style="padding:2px 16px">${a.payments.map(p => html`<div class="prow">
@@ -2030,7 +2104,7 @@ function viewRules() {
   return html`<div class="page narrow"><h1 class="title">How it works</h1><p class="sub">Short version: claim, pay, we match it, we ship.</p>
     <div class="card"><h2 class="ch">Claiming</h2><ul style="margin:8px 0 0 18px"><li>Pick items, then claim with your Instagram username. First time, you also create a passcode.</li><li>A claim holds your items for <b>${S.settings.holdHours} hours</b>. If nothing is paid by then, the hold is released for the next person.</li><li><b>Pre-claim</b> items haven’t arrived yet. You can claim them early and pay by the date shown.</li></ul></div>
     <div class="card"><h2 class="ch">Paying</h2><ul style="margin:8px 0 0 18px"><li>Send money with ${ms.length ? ms.map(m => m.label).join(', ') : 'the seller’s payment methods'}, then open <b>My orders → Pay</b> and upload a screenshot.</li><li>The seller checks your payment against their own account. A screenshot alone never marks an order paid.</li><li>Paid too much, or paid before claiming? The extra stays as <b>credit</b> and is used on your next claim automatically.</li><li>If a payment is rejected you’ll see why, and your hold gets extra time to fix it.</li></ul></div>
-    <div class="card"><h2 class="ch">Shipping</h2><ul style="margin:8px 0 0 18px"><li>Paid orders are packed, then shipped. Tracking appears on your order when there is one.</li><li>Some orders get a shipping fee added after packing. It shows up as a new amount to pay.</li></ul></div></div>`;
+    <div class="card"><h2 class="ch">Shipping</h2><ul style="margin:8px 0 0 18px"><li>Paid orders are packed, then shipped. Once the seller confirms your payment, <b>My orders</b> asks for your shipping address. Add it there.</li><li>Tracking appears on your order when there is one.</li><li>Some orders get a shipping fee added after packing. It shows up as a new amount to pay.</li></ul></div></div>`;
 }
 
 /* ======================= SELLER VIEWS ======================= */
@@ -2069,6 +2143,7 @@ function admDashboard() {
     ${st(n.expiringSoon, 'Holds ending within 6 hours', '#/admin/orders', n.expiringSoon > 0)}
     ${st(n.toPack, 'Paid, ready to pack', '#/admin/orders', n.toPack > 0)}
     ${st(n.toShip, 'Packed, ready to ship', '#/admin/orders')}
+    ${st(n.needAddress, 'Paid, no shipping address yet', '#/admin/orders', n.needAddress > 0)}
     ${st(money(n.receivableCents), 'Owed to you on open orders', '#/admin/orders')}
     ${st(money(n.receivedCents), 'Confirmed payments, all time', '#/admin/reconcile')}
     ${st(money(n.creditCents), 'Credit you’re holding for buyers', '#/admin/buyers')}
@@ -2129,7 +2204,7 @@ function admReconcile() {
         ${recent.length ? html`<details style="margin-top:14px"><summary class="small" style="cursor:pointer">Recently matched (${recent.length})</summary>${recent.map(t => html`<div class="small" style="padding:6px 0;border-bottom:1px solid var(--line)">${money(t.amountCents)} ${t.method} from ${t.senderName || 'unknown'}, matched to payment #${(Core.byId(S.payments, t.paymentId) || {}).no}</div>`)}</details>` : ''}</section></div>`;
 }
 
-const ORDER_FILTERS = [['open', 'All open'], ['unpaid', 'Unpaid'], ['partial', 'Part paid'], ['pack', 'To pack'], ['ship', 'To ship'], ['sent', 'Shipped'], ['closed', 'Expired or cancelled']];
+const ORDER_FILTERS = [['open', 'All open'], ['unpaid', 'Unpaid'], ['partial', 'Part paid'], ['pack', 'To pack'], ['ship', 'To ship'], ['noaddr', 'Needs address'], ['sent', 'Shipped'], ['closed', 'Expired or cancelled']];
 /** Table cell that also works as a labelled row on phones (see .tw.stack in the CSS). */
 const cell = (label, inner, cls = '') => html`<td data-label="${label}" class="${cls}"><div>${inner}</div></td>`;
 function admOrders() {
@@ -2142,6 +2217,7 @@ function admOrders() {
       case 'partial': return o.status === 'open' && ps === 'partial';
       case 'pack': return o.status === 'open' && ps === 'paid' && o.fulfillment === 'pending';
       case 'ship': return o.status === 'open' && ps === 'paid' && o.fulfillment === 'packed';
+      case 'noaddr': return Core.needsAddress(S, o);
       case 'sent': return o.status === 'open' && o.fulfillment === 'shipped';
       default: return o.status !== 'open';
     }
@@ -2244,12 +2320,28 @@ const MODALS = {
       <div class="ototals" style="border-radius:10px;margin:8px 0"><span>Total</span><b style="text-align:right">${money(Core.orderTotal(o))}</b><span>Paid</span><span style="text-align:right">${money(paid)}</span><span class="big">Due</span><span class="big" style="text-align:right">${money(due)}</span></div>
       ${allocs.length ? html`<div class="small" style="margin-bottom:8px"><b>Money on this order</b>${allocs.map(({ a, p }) => html`<div>${money(a.amountCents)} from payment #${p ? p.no : '?'} (${p ? p.status : ''}${p && p.verifiedManually ? ', checked by hand' : ''})</div>`)}</div>` : ''}
       ${o.status === 'open' ? html`<hr class="div">
+        <div class="field"><div class="lbl">Ship to</div>${o.shipTo ? html`<div class="addr">${Core.addressLines(o.shipTo).map(l => html`<div>${l}</div>`)}</div>
+          <div class="small muted" style="margin-top:4px">${o.shipTo.by === 'seller' ? 'Entered by you' : 'Added by the buyer'}, ${dt(o.shipTo.savedAt)}</div>
+          <div class="row" style="margin-top:8px"><button type="button" class="btn sm" data-act="copy" data-text="${Core.addressText(o.shipTo)}">${ic('copy')} Copy address</button><button type="button" class="btn sm" data-act="seller-address" data-id="${o.id}">Edit</button><button type="button" class="btn sm ghost" data-act="clear-address" data-id="${o.id}">Remove</button></div>`
+          : html`<div class="note ${due === 0 ? 'amber' : ''}">${due === 0 ? 'Waiting for the buyer’s address. They’re asked for it on their order page now that this is paid.' : 'The buyer can add an address once their payment is confirmed.'}</div>
+          <div class="row" style="margin-top:8px"><button type="button" class="btn sm" data-act="seller-address" data-id="${o.id}">Enter it myself</button></div>`}</div>
         <div class="field"><label for="om-ship">Shipping fee</label><div class="row" style="flex-wrap:nowrap"><div class="affix grow"><span>$</span><input id="om-ship" value="${((o.shippingFeeCents || 0) / 100).toFixed(2)}" inputmode="decimal"></div><button type="button" class="btn" data-act="save-ship" data-id="${o.id}">Save</button></div><div class="hint">Added to what the buyer owes. If they’ve already paid, the new balance shows up on their order.</div></div>
         ${paid === 0 && pend === 0 ? html`<div class="row" style="margin-bottom:12px"><span class="small">Hold ends ${dt(o.holdExpiresAt)}</span><button type="button" class="btn sm" data-act="extend" data-id="${o.id}">Add 24 hours</button></div>` : ''}
         <div class="field"><label for="om-track">Tracking number</label><input id="om-track" value="${o.tracking || ''}" maxlength="80"></div>
         <div class="row">${['pending', 'packed', 'shipped'].map(k => html`<button type="button" class="btn sm ${o.fulfillment === k ? 'primary' : ''}" data-act="fulfil" data-id="${o.id}" data-to="${k}" ${k !== 'pending' && due > 0 ? raw('disabled title="Not fully paid yet"') : ''}>${{ pending: 'Not packed', packed: 'Packed', shipped: 'Shipped' }[k]}</button>`)}</div>
         <hr class="div"><div class="row"><button type="button" class="btn sm" data-act="manual-pay" data-id="${o.id}" ${due > 0 ? '' : raw('disabled')}>Record cash or other payment</button><button type="button" class="btn sm danger right" data-act="cancel-admin" data-id="${o.id}">Cancel order and restock</button></div>` : html`<div class="note">${o.cancelReason || 'Closed'}</div>`}`;
   },
+  address: m => html`<div class="shead"><h2 class="grow">${m.mode === 'seller' ? 'Shipping address for #' + m.no : 'Shipping address'}</h2>${closeBtn}</div>
+    <form data-form="address" novalidate><p class="small muted" style="margin-bottom:12px">${m.mode === 'seller' ? 'Type or fix the address for this order.' : 'This is used for ' + m.nos.map(n => '#' + n).join(', ') + '. Check it carefully: the parcel goes exactly where you write.'}</p>
+      <div class="field"><label for="ad-name">Full name</label><input id="ad-name" name="name" value="${m.values.name || ''}" autocomplete="name" maxlength="80" required></div>
+      <div class="field"><label for="ad-line1">Street address</label><input id="ad-line1" name="line1" value="${m.values.line1 || ''}" autocomplete="address-line1" maxlength="120" required></div>
+      <div class="field"><label for="ad-line2">Apartment, unit, etc. <span class="muted">(optional)</span></label><input id="ad-line2" name="line2" value="${m.values.line2 || ''}" autocomplete="address-line2" maxlength="120"></div>
+      <div class="two"><div class="field"><label for="ad-city">City</label><input id="ad-city" name="city" value="${m.values.city || ''}" autocomplete="address-level2" maxlength="60" required></div>
+        <div class="field"><label for="ad-region">State or province</label><input id="ad-region" name="region" value="${m.values.region || ''}" autocomplete="address-level1" maxlength="60"></div></div>
+      <div class="two"><div class="field"><label for="ad-postal">ZIP or postal code</label><input id="ad-postal" name="postal" value="${m.values.postal || ''}" autocomplete="postal-code" maxlength="20" required></div>
+        <div class="field"><label for="ad-country">Country</label><input id="ad-country" name="country" value="${m.values.country || 'United States'}" autocomplete="country-name" maxlength="60" required></div></div>
+      <div class="err" id="ad-err" role="alert" hidden></div>
+      <div class="row" style="justify-content:flex-end"><button type="button" class="btn" data-act="close-modal">Cancel</button><button class="btn primary">Save address</button></div></form>`,
   manualpay: m => { const o = Core.byId(S.orders, m.id); return html`<div class="shead"><h2 class="grow">Record a payment for #${o ? o.no : ''}</h2>${closeBtn}</div><form data-form="manualpay" novalidate><div class="two"><div class="field"><label for="mp-a">Amount received</label><div class="affix"><span>$</span><input id="mp-a" name="amount" inputmode="decimal" value="${o ? (Core.orderDue(S, o) / 100).toFixed(2) : ''}"></div></div><div class="field"><label for="mp-m">How</label><select id="mp-m" name="method">${S.settings.methods.map(x => html`<option value="${x.key}" ${x.key === 'other' ? raw('selected') : ''}>${x.label}</option>`)}</select></div></div><div class="field"><label for="mp-n">Note</label><input id="mp-n" name="note" maxlength="120" placeholder="Cash at pickup"></div><div class="err" id="mp-err" role="alert" hidden></div><div class="row" style="justify-content:flex-end"><button type="button" class="btn" data-act="close-modal">Cancel</button><button class="btn primary">Record payment</button></div></form>`; },
   group: m => { const g = m.id ? Core.byId(S.groups, m.id) : null; return html`<div class="shead"><h2 class="grow">${g ? 'Edit group' : 'New group'}</h2>${closeBtn}</div><form data-form="group" novalidate><div class="two"><div class="field"><label for="gp-n">Name</label><input id="gp-n" name="name" value="${g ? g.name : ''}" required></div><div class="field"><label for="gp-c">Colour</label><input id="gp-c" name="color" type="color" value="${g ? g.color : '#5BAFD6'}" style="height:40px;padding:3px"></div></div>
     <div class="field"><label for="gp-m">Members <span class="muted">(one per line, used to fill in variants)</span></label><textarea id="gp-m" name="members" rows="5">${g ? g.members.join('\n') : ''}</textarea></div>${g ? html`<label class="check"><input type="checkbox" name="active" ${g.active ? raw('checked') : ''}><span>Show this group in the shop</span></label>` : ''}<div class="err" id="gp-err" role="alert" hidden></div><div class="row" style="justify-content:flex-end"><button type="button" class="btn" data-act="close-modal">Cancel</button><button class="btn primary">Save group</button></div></form>`; },
@@ -2311,6 +2403,11 @@ const ACT = {
   'pay-all': () => { ui.pay = null; go('#/pay'); },
   'pay-ahead': () => { pickPaymentTarget([]); go('#/pay'); },
   'pay-order': el => { pickPaymentTarget([el.dataset.id]); go('#/pay'); },
+  'edit-address': async () => {
+    const a = await api.myAccount(ui.session), el = addressEligible(a); if (!el.length) { render(); return; }
+    const have = el.find(o => o.shipTo);
+    openModal({ type: 'address', mode: 'buyer', nos: el.map(o => o.no), values: (have && have.shipTo) || a.lastShipTo || {}, label: 'Shipping address' });
+  },
   'cancel-mine': async el => {
     if (!await askConfirm({ title: 'Cancel this claim?', body: 'The items go back on sale for other people.', ok: 'Cancel claim', danger: true })) return;
     await guard(async () => { await api.cancelMyOrder({ ...ui.session, orderId: el.dataset.id }); toast('Claim cancelled'); render(); });
@@ -2346,6 +2443,8 @@ const ACT = {
   'save-ship': el => guard(async () => { const c = Core.parseMoney($('#om-ship').value || '0'); if (Number.isNaN(c)) throw new Core.AppError('bad_amount', 'Enter the shipping fee like 3.80.'); const r = await adm.setShippingFee({ orderId: el.dataset.id, cents: c }); toast('Shipping fee saved' + (r.returnedToCreditCents ? ` (${money(r.returnedToCreditCents)} back to credit)` : '')); renderModal(); render(); }),
   'extend': el => guard(async () => { await adm.extendHold({ orderId: el.dataset.id, hours: 24 }); toast('Hold extended by 24 hours'); renderModal(); render(); }),
   'fulfil': el => guard(async () => { await adm.setFulfillment({ orderId: el.dataset.id, to: el.dataset.to, tracking: ($('#om-track') || {}).value || '' }); toast('Order updated'); renderModal(); render(); }),
+  'seller-address': el => { const o = Core.byId(S.orders, el.dataset.id); if (o) openModal({ type: 'address', mode: 'seller', id: o.id, no: o.no, values: o.shipTo || {}, label: 'Shipping address' }); },
+  'clear-address': el => guard(async () => { await adm.setOrderAddress({ orderId: el.dataset.id, address: null }); toast('Address removed'); renderModal(); render(); }),
   'manual-pay': el => openModal({ type: 'manualpay', id: el.dataset.id, label: 'Record a payment' }),
   'cancel-admin': async el => { if (!await askConfirm({ title: 'Cancel this order?', body: 'The items go back into stock. Any money already paid on it becomes credit for the buyer.', ok: 'Cancel order', danger: true })) return; await guard(async () => { await adm.cancelOrder({ orderId: el.dataset.id }); toast('Order cancelled'); render(); }); },
   'edit-group': el => openModal({ type: 'group', id: el.dataset.id, label: 'Group' }),
@@ -2457,6 +2556,16 @@ const FORMS = {
       status: f.status.value, imageUrl: f.imageUrl.value.trim(), description: f.description.value, variants });
     closeModal(); toast('Product saved'); render();
   }, 'pe-err'),
+  address: f => guard(async () => {
+    const m = ui.modal, address = {};
+    ['name', 'line1', 'line2', 'city', 'region', 'postal', 'country'].forEach(k => { address[k] = f.elements.namedItem(k).value; });
+    if (m.mode === 'seller') {
+      await adm.setOrderAddress({ orderId: m.id, address }); closeModal(); toast('Address saved');
+      openModal({ type: 'order', id: m.id, label: 'Order', wide: true }); render();
+    } else {
+      await api.saveAddress({ ...ui.session, address }); closeModal(); toast('Address saved'); render();
+    }
+  }, 'ad-err'),
   merge: f => guard(async () => { await adm.mergeBuyer({ from: ui.modal.from, to: f.to.value }); closeModal(); toast('Buyers merged'); render(); }, 'mg-err'),
   settings: f => guard(async () => {
     const tol = Core.parseMoney(f.tol.value); if (Number.isNaN(tol)) throw new Core.AppError('bad_input', 'Near-match amount should look like 1.00.');
